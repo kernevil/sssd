@@ -265,6 +265,24 @@ _sbus_sss_invoker_write_uss
    (DBusMessageIter *iter,
     struct _sbus_sss_invoker_args_uss *args);
 
+struct _sbus_sss_invoker_args_uuss {
+    uint32_t arg0;
+    uint32_t arg1;
+    const char * arg2;
+    const char * arg3;
+};
+
+errno_t
+_sbus_sss_invoker_read_uuss
+   (TALLOC_CTX *mem_ctx,
+    DBusMessageIter *iter,
+    struct _sbus_sss_invoker_args_uuss *args);
+
+errno_t
+_sbus_sss_invoker_write_uuss
+   (DBusMessageIter *iter,
+    struct _sbus_sss_invoker_args_uuss *args);
+
 struct _sbus_sss_invoker_args_uusss {
     uint32_t arg0;
     uint32_t arg1;
