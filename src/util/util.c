@@ -1067,3 +1067,47 @@ bool local_provider_is_built(void)
     return false;
 #endif
 }
+
+errno_t sss_canonicalize_ip_address(TALLOC_CTX *mem_ctx,
+                                    const char *address,
+                                    char **canonical_address)
+{
+    char binaddr[16];
+    const char *pcanon;
+
+    if (inet_pton(AF_INET6, address, binaddr) == 1) {
+        *canonical_address = talloc_size(mem_ctx, INET6_ADDRSTRLEN);
+        if (*canonical_address == NULL) {
+            return ENOMEM;
+        }
+
+        pcanon = inet_ntop(AF_INET6, binaddr, *canonical_address,
+                           INET6_ADDRSTRLEN);
+        if (pcanon == NULL) {
+            talloc_free(*canonical_address);
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Failed to canonicalize address [%s]: %s", address,
+                  strerror(errno));
+            return EINVAL;
+        }
+    } else if (inet_pton(AF_INET, address, binaddr) == 1) {
+        *canonical_address = talloc_size(mem_ctx, INET_ADDRSTRLEN);
+        if (*canonical_address == NULL) {
+            return ENOMEM;
+        }
+
+        pcanon = inet_ntop(AF_INET, binaddr, *canonical_address,
+                           INET_ADDRSTRLEN);
+        if (pcanon == NULL) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Failed to canonicalize address [%s]: %s", address,
+                  strerror(errno));
+            talloc_free(*canonical_address);
+            return EINVAL;
+        }
+    } else {
+        return EAFNOSUPPORT;
+    }
+
+    return EOK;
+}
