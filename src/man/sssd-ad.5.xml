@@ -1047,6 +1047,25 @@ ad_gpo_map_deny = +my_pam_service
                 </varlistentry>
 
                 <varlistentry>
+                    <term>ad_allow_remote_domain_local_groups (boolean)</term>
+                    <listitem>
+                        <para>
+                            If this option is set to true SSSD will not filter
+                            out domain local groups from other domains in the AD
+                            forest. By default they are filtered out e.g. when
+                            following a nested group hierarchy in other domains
+                            because they are not valid in the local domain. To
+                            be compatible with other solutions which make AD
+                            users and groups available on Linux client this
+                            option was added.
+                        </para>
+                        <para>
+                            Default: False
+                        </para>
+                    </listitem>
+                </varlistentry>
+
+                <varlistentry>
                     <term>dyndns_update (boolean)</term>
                     <listitem>
                         <para>
