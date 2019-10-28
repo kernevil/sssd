@@ -106,6 +106,9 @@ passwd: root
 group:
 	echo "root:x:0:" > $@
 
+hosts:
+	echo "" > $@
+
 PAM_SERVICE_DIR=pam_service_dir
 pam_sss_service:
 	$(MKDIR_P) $(PAM_SERVICE_DIR)
@@ -142,7 +145,7 @@ pam_sss_allow_missing_name:
 	echo "password required       $(DESTDIR)$(pammoddir)/pam_sss.so" >> $(PAM_SERVICE_DIR)/$@
 	echo "session  required       $(DESTDIR)$(pammoddir)/pam_sss.so" >> $(PAM_SERVICE_DIR)/$@
 
-CLEANFILES=config.py config.pyc passwd group
+CLEANFILES=config.py config.pyc passwd group hosts
 
 clean-local:
 	rm -Rf root
@@ -156,7 +159,7 @@ PAM_CERT_DB_PATH="$(abs_builddir)/../test_CA/SSSD_test_CA.pem"
 SOFTHSM2_CONF="$(abs_builddir)/../test_CA/softhsm2_one.conf"
 endif
 
-intgcheck-installed: config.py passwd group pam_sss_service pam_sss_alt_service pam_sss_sc_required pam_sss_try_sc pam_sss_allow_missing_name
+intgcheck-installed: config.py passwd group hosts pam_sss_service pam_sss_alt_service pam_sss_sc_required pam_sss_try_sc pam_sss_allow_missing_name
 	pipepath="$(DESTDIR)$(pipepath)"; \
 	if test $${#pipepath} -gt 80; then \
 	    echo "error: Pipe directory path too long," \
@@ -179,6 +182,7 @@ intgcheck-installed: config.py passwd group pam_sss_service pam_sss_alt_service 
 	LD_LIBRARY_PATH="$$LD_LIBRARY_PATH:$(DESTDIR)$(nsslibdir)" \
 	NSS_WRAPPER_PASSWD="$(abs_builddir)/passwd" \
 	NSS_WRAPPER_GROUP="$(abs_builddir)/group" \
+	NSS_WRAPPER_HOSTS="$(abs_builddir)/hosts" \
 	NSS_WRAPPER_MODULE_SO_PATH="$(DESTDIR)$(nsslibdir)/libnss_sss.so.2" \
 	NSS_WRAPPER_MODULE_FN_PREFIX="sss" \
 	UID_WRAPPER=1 \

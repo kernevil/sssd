@@ -257,3 +257,43 @@ def test_hostbyname(add_hosts):
     (res, hres, _) = call_sssd_gethostbyname("host2_alias2.example.com")
     assert res == NssReturnCode.SUCCESS
     assert hres == 0
+
+    # Test glibc getaddrinfo
+    ent.assert_getaddrinfo('host1', dict(name="host1",
+                          addresses=["192.168.1.1", "192.168.1.2",
+                                     "2001:db8:1::1", "2001:db8:1::2"]))
+
+    ent.assert_getaddrinfo('host1_alias1', dict(name="host1_alias1",
+                          addresses=["192.168.1.1", "192.168.1.2",
+                                     "2001:db8:1::1", "2001:db8:1::2"]))
+
+    ent.assert_getaddrinfo('host1_alias2', dict(name="host1_alias2",
+                          addresses=["192.168.1.1", "192.168.1.2",
+                                     "2001:db8:1::1", "2001:db8:1::2"]))
+
+    # Test glibc gethotbyname and gethostbyaddr (Only IPv4)
+    host1_getbyname = dict(name="host1",
+                           aliases=["host1_alias1", "host1_alias2"],
+                           addresses=["192.168.1.1", "192.168.1.2"])
+
+    ent.assert_gethostbyname('HOST1',        host1_getbyname)
+    ent.assert_gethostbyname('host1',        host1_getbyname)
+    ent.assert_gethostbyname('host1_ALIAS1', host1_getbyname)
+    ent.assert_gethostbyname('host1_ALIAS2', host1_getbyname)
+
+    ent.assert_gethostbyaddr('192.168.1.1',
+                             dict(name="host1",
+                                  aliases=["host1_alias1", "host1_alias2"],
+                                  addresses=["192.168.1.1", "192.168.1.2"]))
+    ent.assert_gethostbyaddr('192.168.1.2',
+                             dict(name="host1",
+                                  aliases=["host1_alias1", "host1_alias2"],
+                                  addresses=["192.168.1.1", "192.168.1.2"]))
+    ent.assert_gethostbyaddr('2001:Db8:1:0::0000:1',
+                             dict(name="host1",
+                                  aliases=["host1_alias1", "host1_alias2"],
+                                  addresses=["2001:db8:1::1", "2001:db8:1::2"]))
+    ent.assert_gethostbyaddr('2001:0DB8:1:0000:0000::2',
+                             dict(name="host1",
+                                  aliases=["host1_alias1", "host1_alias2"],
+                                  addresses=["2001:db8:1::1", "2001:db8:1::2"]))

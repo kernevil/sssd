@@ -505,3 +505,66 @@ def assert_group(pattern):
     """
     d = _diff_group(pattern)
     assert not d, d
+
+
+def _convert_host_addrinfo(host):
+    """
+    Convert a 5-tuple list entry returned by getaddrinfo to an entry dictionary.
+    """
+    ret = {}
+    if (len(host) > 0):
+        ret["name"] = host[0][3]
+        ret["addresses"] = []
+
+    for entry in host:
+        if entry[4]:
+            ret["addresses"].append(entry[4][0])
+
+    return ret
+
+
+def assert_getaddrinfo(name, pattern):
+    """Assert a hostent entry, retrieved by name, matches a pattern."""
+    try:
+        res = socket.getaddrinfo(name, None, 0, socket.SOCK_RAW, 0,
+                                 socket.AI_CANONNAME)
+        ent = _convert_host_addrinfo(res)
+    except KeyError as err:
+        assert False, err
+    d = _diff(ent, pattern)
+    assert not d, d
+
+
+def _convert_host_getby(host):
+    """
+    Convert a 3-tuple list entry returned by gethostbyaddr or gethostbyname_ex
+    to an entry dictionary.
+    """
+    return dict(
+        name=host[0],
+        aliases=host[1],
+        addresses=host[2])
+
+    return ret
+
+
+def assert_gethostbyname(name, pattern):
+    """Assert a hostent entry, retrieved by name, matches a pattern."""
+    try:
+        res = socket.gethostbyname_ex(name)
+        ent = _convert_host_getby(res)
+    except KeyError as err:
+        assert False, err
+    d = _diff(ent, pattern)
+    assert not d, d
+
+
+def assert_gethostbyaddr(addr, pattern):
+    """Assert a hostent entry, retrieved by address, matches a pattern."""
+    try:
+        res = socket.gethostbyaddr(addr)
+        ent = _convert_host_getby(res)
+    except KeyError as err:
+        assert False, err
+    d = _diff(ent, pattern)
+    assert not d, d
