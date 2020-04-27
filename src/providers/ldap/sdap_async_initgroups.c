@@ -2697,6 +2697,7 @@ struct sdap_get_initgr_state {
     bool non_posix;
 
     struct sysdb_attrs *orig_user;
+    const char *orig_dn;
 
     size_t user_base_iter;
     struct sdap_search_base **user_search_bases;
@@ -3010,7 +3011,6 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
     size_t count;
     int ret;
     errno_t sret;
-    const char *orig_dn;
     const char *cname;
     bool in_transaction = false;
 
@@ -3122,7 +3122,7 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
     case SDAP_SCHEMA_AD:
         ret = sysdb_attrs_get_string(state->orig_user,
                                      SYSDB_ORIG_DN,
-                                     &orig_dn);
+                                     &state->orig_dn);
         if (ret != EOK) {
             tevent_req_error(req, ret);
             return;
@@ -3140,21 +3140,21 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
                                                          state->sysdb,
                                                          state->dom,
                                                          state->sh,
-                                                         cname, orig_dn,
+                                                         cname,
+                                                         state->orig_dn,
                                                          state->timeout,
                                                          state->use_id_mapping);
         } else {
             subreq = sdap_initgr_rfc2307bis_send(
                     state, state->ev, state->opts,
                     state->sdom, state->sh,
-                    cname, orig_dn);
+                    cname, state->orig_dn);
         }
         if (!subreq) {
             tevent_req_error(req, ENOMEM);
             return;
         }
 
-        talloc_steal(subreq, orig_dn);
         tevent_req_set_callback(subreq, sdap_get_initgr_done, req);
         break;
 
