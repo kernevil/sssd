@@ -2698,6 +2698,7 @@ struct sdap_get_initgr_state {
 
     struct sysdb_attrs *orig_user;
     const char *orig_dn;
+    const char *cname;
 
     size_t user_base_iter;
     struct sdap_search_base **user_search_bases;
@@ -3011,7 +3012,6 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
     size_t count;
     int ret;
     errno_t sret;
-    const char *cname;
     bool in_transaction = false;
 
     DEBUG(SSSDBG_TRACE_ALL, "Receiving info for the user\n");
@@ -3097,7 +3097,8 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
     }
     in_transaction = false;
 
-    ret = sysdb_get_real_name(state, state->dom, state->filter_value, &cname);
+    ret = sysdb_get_real_name(state, state->dom, state->filter_value,
+                              &state->cname);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE, "Cannot canonicalize username\n");
         tevent_req_error(req, ret);
@@ -3110,7 +3111,7 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
     case SDAP_SCHEMA_RFC2307:
         subreq = sdap_initgr_rfc2307_send(state, state->ev, state->opts,
                                           state->sysdb, state->dom, state->sh,
-                                          cname);
+                                          state->cname);
         if (!subreq) {
             tevent_req_error(req, ENOMEM);
             return;
@@ -3140,7 +3141,7 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
                                                          state->sysdb,
                                                          state->dom,
                                                          state->sh,
-                                                         cname,
+                                                         state->cname,
                                                          state->orig_dn,
                                                          state->timeout,
                                                          state->use_id_mapping);
@@ -3148,7 +3149,7 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
             subreq = sdap_initgr_rfc2307bis_send(
                     state, state->ev, state->opts,
                     state->sdom, state->sh,
-                    cname, state->orig_dn);
+                    state->cname, state->orig_dn);
         }
         if (!subreq) {
             tevent_req_error(req, ENOMEM);
