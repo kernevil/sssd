@@ -1066,6 +1066,26 @@ ad_gpo_map_deny = +my_pam_service
                 </varlistentry>
 
                 <varlistentry>
+                    <term>ad_remote_dlg_enabled_domains (string)</term>
+                    <listitem>
+                        <para>
+                            Comma separated list of domains and subdomains
+                            that will be contacted to retrieve the remote
+                            domain local groups. If unset, all domains will
+                            be queried.
+                        </para>
+                        <para>
+                            This setting is relevant only if
+                            <quote>ad_allow_remote_domain_local_groups</quote>
+                            is set.
+                        </para>
+                        <para>
+                            Default: Not set
+                        </para>
+                    </listitem>
+                </varlistentry>
+
+                <varlistentry>
                     <term>dyndns_update (boolean)</term>
                     <listitem>
                         <para>

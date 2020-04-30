@@ -1118,6 +1118,48 @@ void ad_set_ssf_for_ldaps(struct sdap_options *id_opts)
     }
 }
 
+static errno_t ad_get_remote_dlg_enabled_domains(TALLOC_CTX *mem_ctx,
+                                                 struct ad_options *ad_opts,
+                                                 const char ***out)
+{
+    const char *str = NULL;
+    const char **domains = NULL;
+    TALLOC_CTX *tmp_ctx = NULL;
+    size_t count = 0;
+    errno_t ret;
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        return ENOMEM;
+    }
+
+    str = dp_opt_get_cstring(ad_opts->basic,
+                             AD_REMOTE_DLG_ENABLED_DOMAINS);
+    if (str == NULL) {
+        *out = NULL;
+        ret = EOK;
+        goto done;
+    }
+
+    ret = split_on_separator(tmp_ctx, str, ',', true, true,
+                             discard_const_p(char **, &domains), &count);
+    if (ret != EOK) {
+        str = ad_opts->basic[AD_REMOTE_DLG_ENABLED_DOMAINS].opt_name;
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "Failed to parse option [%s], [%i] [%s]!\n",
+              str, ret, sss_strerror(ret));
+        ret = EINVAL;
+        goto done;
+    }
+
+    *out = talloc_steal(mem_ctx, domains);
+    ret = EOK;
+
+done:
+    talloc_zfree(tmp_ctx);
+    return ret;
+}
+
 static errno_t
 ad_set_sdap_options(struct ad_options *ad_opts,
                     struct sdap_options *id_opts)
@@ -1167,6 +1209,12 @@ ad_set_sdap_options(struct ad_options *ad_opts,
 
     id_opts->allow_remote_domain_local_groups = dp_opt_get_bool(ad_opts->basic,
                                                   AD_ALLOW_REMOTE_DOMAIN_LOCAL);
+
+    ret = ad_get_remote_dlg_enabled_domains(id_opts, ad_opts,
+                                        &id_opts->remote_dlg_enabled_domains);
+    if (ret != EOK) {
+        goto done;
+    }
 
     ret = sdap_set_sasl_options(id_opts,
                                 dp_opt_get_string(ad_opts->basic,

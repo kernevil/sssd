@@ -315,6 +315,7 @@ class SSSDOptions(object):
                                                       'database'),
         'ad_use_ldaps': _('Use LDAPS port for LDAP and Global Catalog requests'),
         'ad_allow_remote_domain_local_groups' : _('Do not filter domain local groups from other domains'),
+        'ad_remote_dlg_enabled_domains': _('Enabled Active Directory domains to be queried for domain local groups'),
 
         # [provider/krb5]
         'krb5_kdcip': _('Kerberos server address'),
