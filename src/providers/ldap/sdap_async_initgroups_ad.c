@@ -29,6 +29,95 @@
 #include "providers/ad/ad_common.h"
 #include "lib/idmap/sss_idmap.h"
 
+/**
+ * Merge two non null terminated talloc_arrays of SID strings, checking for
+ * duplicated SIDs and NULL elements
+ */
+static errno_t merge_sids_array(TALLOC_CTX *mem_ctx,
+                                char **arr1,
+                                char **arr2,
+                                char ***_out)
+{
+    size_t len1 = talloc_array_length(arr1);
+    size_t len2 = talloc_array_length(arr2);
+    size_t i = 0;
+    size_t j = 0;
+    char **out = NULL;
+
+    if (len1 + len2 < 1) {
+        *_out = NULL;
+        return EOK;
+    }
+
+    out = talloc_zero_array(mem_ctx, char *, len1 + len2);
+    if (out == NULL) {
+        return ENOMEM;
+    }
+
+    /* Process first array, check for NULLs and duplicates */
+    for (i = 0; i < len1; i++) {
+        bool add = true;
+        size_t k = 0;
+
+        if (arr1[i] == NULL) {
+            continue;
+        }
+
+        for (k = 0; k < j; k++) {
+            if (strcasecmp(out[k], arr1[i]) == 0) {
+                add = false;
+                break;
+            }
+        }
+        if (!add) {
+            continue;
+        }
+
+        out[j] = talloc_strdup(out, arr1[i]);
+        if (out[j] == NULL) {
+            talloc_free(out);
+            return ENOMEM;
+        }
+        j++;
+    }
+
+    /* Process second array, check for NULLs and duplicates */
+    for (i = 0; i < len2; i++) {
+        bool add = true;
+        size_t k = 0;
+
+        if (arr2[i] == NULL) {
+            continue;
+        }
+
+        for (k = 0; k < j; k++) {
+            if (strcasecmp(out[k], arr2[i]) == 0) {
+                add = false;
+                break;
+            }
+        }
+        if (!add) {
+            continue;
+        }
+
+        out[j] = talloc_strdup(out, arr2[i]);
+        if (out[j] == NULL) {
+            talloc_free(out);
+            return ENOMEM;
+        }
+        j++;
+    }
+
+    /* shrink final array to final number of elements */
+    out = talloc_realloc(mem_ctx, out, char *, j);
+    if (out == NULL) {
+        return ENOMEM;
+    }
+
+    *_out = out;
+    return EOK;
+}
+
 struct sdap_get_ad_tokengroups_state {
     struct tevent_context *ev;
     struct sss_idmap_ctx *idmap_ctx;
@@ -1738,4 +1827,187 @@ struct sdap_id_conn_ctx *get_ldap_conn_from_sdom_pvt(struct sdap_options *opts,
     }
 
     return user_conn;
+}
+
+/* Remote domain local groups (dlgs) */
+
+struct sdap_ad_get_dlg_state {
+    char **remote_dlgs;
+};
+
+static struct tevent_req *sdap_ad_get_dlg_send(TALLOC_CTX *mem_ctx,
+                                               struct tevent_context *ev_ctx,
+                                               struct sdap_options *opts,
+                                               struct sdap_domain *sdom,
+                                               const char *cname,
+                                               const char *orig_dn,
+                                               bool chase_referrals)
+{
+    struct sdap_ad_get_dlg_state *state = NULL;
+    struct tevent_req *req = NULL;
+
+    req = tevent_req_create(mem_ctx, &state, struct sdap_ad_get_dlg_state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+        return NULL;
+    }
+
+    /* If whitelist is defined but domain is not included, we are done */
+    if (opts->remote_dlg_enabled_domains != NULL &&
+        !string_in_list(sdom->dom->name,
+                discard_const_p(char *, opts->remote_dlg_enabled_domains),
+                false)) {
+        DEBUG(SSSDBG_TRACE_LIBS,
+              "Domain [%s] is not in whitelist, skipping it\n",
+              sdom->dom->name);
+        tevent_req_done(req);
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    /* TODO */
+
+    tevent_req_done(req);
+
+    return tevent_req_post(req, ev_ctx);
+}
+
+static errno_t sdap_ad_get_dlg_recv(struct tevent_req *req,
+                                    TALLOC_CTX *mem_ctx,
+                                    char ***remote_dlgs)
+{
+    struct sdap_ad_get_dlg_state *state =
+            tevent_req_data(req, struct sdap_ad_get_dlg_state);
+
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    if (remote_dlgs != NULL) {
+        *remote_dlgs = talloc_steal(mem_ctx, state->remote_dlgs);
+    }
+
+    return EOK;
+}
+
+struct sdap_ad_remote_dlgs_state {
+    struct tevent_context *ev_ctx;
+    struct sdap_options *opts;
+    struct sdap_domain *sdom;
+    struct sdap_domain *iter;
+    const char *cname;
+    const char *orig_dn;
+    char **remote_dlgs;
+};
+
+static void sdap_ad_get_dlg_next(struct tevent_req *subreq);
+
+struct tevent_req *
+sdap_ad_get_remote_dlg_send(TALLOC_CTX *mem_ctx,
+                            struct tevent_context *ev_ctx,
+                            struct sdap_options *opts,
+                            struct sdap_domain *sdom,
+                            const char *cname,
+                            const char *orig_dn)
+{
+    struct sdap_ad_remote_dlgs_state *state = NULL;
+    struct tevent_req *req = NULL;
+    struct tevent_req *subreq = NULL;
+
+    req = tevent_req_create(mem_ctx, &state,
+                            struct sdap_ad_remote_dlgs_state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "tevent_req_create() failed\n");
+        return NULL;
+    }
+
+    state->ev_ctx = ev_ctx;
+    state->opts = opts;
+    state->sdom = sdom;
+    state->iter = sdom;
+    state->cname = cname;
+    state->orig_dn = orig_dn;
+
+    /* If remote domain local groups are not enabled in config we are done */
+    if (!opts->allow_remote_domain_local_groups) {
+        tevent_req_done(req);
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    /* Iterate the domain list */
+    subreq = sdap_ad_get_dlg_send(state,
+                                  state->ev_ctx,
+                                  state->opts,
+                                  state->iter,
+                                  state->cname,
+                                  state->orig_dn,
+                                  true);
+    if (tevent_req_nomem(subreq, req)) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+        return tevent_req_post(req, ev_ctx);
+    }
+    tevent_req_set_callback(subreq, sdap_ad_get_dlg_next, req);
+
+    return req;
+}
+
+static void sdap_ad_get_dlg_next(struct tevent_req *subreq)
+{
+    struct tevent_req *req = NULL;
+    struct sdap_ad_remote_dlgs_state *state = NULL;
+    errno_t ret;
+    char **remote_dlgs = NULL;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct sdap_ad_remote_dlgs_state);
+
+    ret = sdap_ad_get_dlg_recv(subreq, state, &remote_dlgs);
+    talloc_zfree(subreq);
+    if (tevent_req_error(req, ret)) {
+        DEBUG(SSSDBG_OP_FAILURE, "Failed to get DLGs from domain [%s]\n",
+              state->iter->dom->name);
+        return;
+    }
+
+    ret = merge_sids_array(state, state->remote_dlgs, remote_dlgs,
+                           &state->remote_dlgs);
+    if (tevent_req_error(req, ret)) {
+        DEBUG(SSSDBG_OP_FAILURE, "Failed to merge SIDs array [%s]\n",
+              strerror(ret));
+        return;
+    }
+    talloc_zfree(remote_dlgs);
+
+    /* Continue with next domain in the domain list */
+    state->iter = state->iter->next;
+    if (state->iter != NULL && state->iter != state->sdom) {
+        subreq = sdap_ad_get_dlg_send(state,
+                                      state->ev_ctx,
+                                      state->opts,
+                                      state->iter,
+                                      state->cname,
+                                      state->orig_dn,
+                                      true);
+        if (tevent_req_nomem(subreq, req)) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+            return;
+        }
+        tevent_req_set_callback(subreq, sdap_ad_get_dlg_next, req);
+        return;
+    }
+
+    tevent_req_done(req);
+}
+
+errno_t sdap_ad_get_remote_dlg_recv(struct tevent_req *req,
+                                    TALLOC_CTX *mem_ctx,
+                                    char ***remote_dlgs)
+{
+    struct sdap_ad_remote_dlgs_state *state =
+            tevent_req_data(req, struct sdap_ad_remote_dlgs_state);
+
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    if (remote_dlgs != NULL) {
+        *remote_dlgs = talloc_steal(mem_ctx, state->remote_dlgs);
+    }
+
+    return EOK;
 }

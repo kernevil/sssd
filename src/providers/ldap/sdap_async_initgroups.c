@@ -2701,6 +2701,9 @@ struct sdap_get_initgr_state {
     const char *orig_dn;
     const char *cname;
 
+    char **remote_dlgs;
+    size_t num_remote_dlgs;
+
     size_t user_base_iter;
     struct sdap_search_base **user_search_bases;
 
@@ -3003,6 +3006,8 @@ static int sdap_search_initgr_user_in_batch(struct sdap_get_initgr_state *state,
     return ret;
 }
 
+static void sdap_ad_get_remote_dlg_done(struct tevent_req *subreq);
+
 static void sdap_get_initgr_user(struct tevent_req *subreq)
 {
     struct tevent_req *req = tevent_req_callback_data(subreq,
@@ -3129,35 +3134,18 @@ static void sdap_get_initgr_user(struct tevent_req *subreq)
             tevent_req_error(req, ret);
             return;
         }
-
-        if (state->opts->dc_functional_level >= DS_BEHAVIOR_WIN2003
-            && dp_opt_get_bool(state->opts->basic, SDAP_AD_USE_TOKENGROUPS)) {
-            /* Take advantage of AD's tokenGroups mechanism to look up all
-             * parent groups in a single request.
-             */
-            subreq = sdap_ad_tokengroups_initgroups_send(state, state->ev,
-                                                         state->id_ctx,
-                                                         state->conn,
-                                                         state->opts,
-                                                         state->sysdb,
-                                                         state->dom,
-                                                         state->sh,
-                                                         state->cname,
-                                                         state->orig_dn,
-                                                         state->timeout,
-                                                         state->use_id_mapping);
-        } else {
-            subreq = sdap_initgr_rfc2307bis_send(
-                    state, state->ev, state->opts,
-                    state->sdom, state->sh,
-                    state->cname, state->orig_dn);
-        }
-        if (!subreq) {
-            tevent_req_error(req, ENOMEM);
+        subreq = sdap_ad_get_remote_dlg_send(state,
+                                             state->ev,
+                                             state->opts,
+                                             state->sdom,
+                                             state->cname,
+                                             state->orig_dn);
+        if (tevent_req_nomem(subreq, req)) {
             return;
         }
-
-        tevent_req_set_callback(subreq, sdap_get_initgr_done, req);
+        tevent_req_set_callback(subreq,
+                                sdap_ad_get_remote_dlg_done,
+                                req);
         break;
 
     case SDAP_SCHEMA_IPA_V1:
@@ -3282,6 +3270,51 @@ static void sdap_ad_check_domain_local_groups_done(struct tevent_req *subreq)
     tevent_req_done(req);
 
     return;
+}
+
+static void sdap_ad_get_remote_dlg_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req = tevent_req_callback_data(subreq,
+                                                      struct tevent_req);
+    struct sdap_get_initgr_state *state = tevent_req_data(req,
+                                               struct sdap_get_initgr_state);
+    int ret;
+
+    ret = sdap_ad_get_remote_dlg_recv(subreq, state, &state->remote_dlgs);
+    talloc_zfree(subreq);
+    if (tevent_req_error(req, ret)) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Error getting remote domain local groups: [%d][%s]\n",
+              ret, strerror(ret));
+        return;
+    }
+
+    if (state->opts->dc_functional_level >= DS_BEHAVIOR_WIN2003
+        && dp_opt_get_bool(state->opts->basic, SDAP_AD_USE_TOKENGROUPS)) {
+        /* Take advantage of AD's tokenGroups mechanism to look up all
+         * parent groups in a single request.
+         */
+        subreq = sdap_ad_tokengroups_initgroups_send(state,
+                                                     state->ev,
+                                                     state->id_ctx,
+                                                     state->conn,
+                                                     state->opts,
+                                                     state->sysdb,
+                                                     state->dom,
+                                                     state->sh,
+                                                     state->cname,
+                                                     state->orig_dn,
+                                                     state->timeout,
+                                                     state->use_id_mapping);
+    } else {
+        subreq = sdap_initgr_rfc2307bis_send(state, state->ev, state->opts,
+                                             state->sdom, state->sh,
+                                             state->cname, state->orig_dn);
+    }
+    if (tevent_req_nomem(subreq, req)) {
+        return;
+    }
+    tevent_req_set_callback(subreq, sdap_get_initgr_done, req);
 }
 
 static void sdap_get_initgr_pgid(struct tevent_req *req);

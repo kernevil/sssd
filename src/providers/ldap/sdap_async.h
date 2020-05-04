@@ -471,4 +471,15 @@ sdap_handle_id_collision_for_incomplete_groups(struct data_provider *dp,
 
 struct sdap_id_conn_ctx *get_ldap_conn_from_sdom_pvt(struct sdap_options *opts,
                                                      struct sdap_domain *sdom);
+
+struct tevent_req *sdap_ad_get_remote_dlg_send(TALLOC_CTX *mem_ctx,
+                                               struct tevent_context *ev_ctx,
+                                               struct sdap_options *opts,
+                                               struct sdap_domain *sdom,
+                                               const char *cname,
+                                               const char *orig_dn);
+int sdap_ad_get_remote_dlg_recv(struct tevent_req *subreq,
+                                TALLOC_CTX *mem_ctx,
+                                char ***remote_dlgs);
+
 #endif /* _SDAP_ASYNC_H_ */
