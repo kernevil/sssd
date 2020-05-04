@@ -1831,9 +1831,71 @@ struct sdap_id_conn_ctx *get_ldap_conn_from_sdom_pvt(struct sdap_options *opts,
 
 /* Remote domain local groups (dlgs) */
 
-struct sdap_ad_get_dlg_state {
+struct sdap_ad_get_dlg_base_state {
+    /* talloc_array (no NULL terminated) of SIDs */
     char **remote_dlgs;
 };
+
+static struct tevent_req *sdap_ad_get_dlg_base_send(TALLOC_CTX *mem_ctx,
+                                                struct tevent_context *ev_ctx,
+                                                struct sdap_options *opts,
+                                                struct sss_domain_info *domain,
+                                                struct sdap_handle *sh,
+                                                struct sdap_search_base *base,
+                                                const char *filter,
+                                                const char **attrs,
+                                                const char *cname,
+                                                const char *orig_dn)
+{
+    struct tevent_req *req = NULL;
+    struct sdap_ad_get_dlg_base_state *state = NULL;
+
+    req = tevent_req_create(mem_ctx, &state, struct sdap_ad_get_dlg_base_state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+        return NULL;
+    }
+
+    tevent_req_done(req);
+
+    return tevent_req_post(req, ev_ctx);
+}
+
+static errno_t sdap_ad_get_dlg_base_recv(struct tevent_req *req,
+                                         TALLOC_CTX *mem_ctx,
+                                         char ***remote_dlgs)
+{
+    struct sdap_ad_get_dlg_base_state *state =
+            tevent_req_data(req, struct sdap_ad_get_dlg_base_state);
+
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    if (remote_dlgs != NULL) {
+        *remote_dlgs = talloc_steal(mem_ctx, state->remote_dlgs);
+    }
+
+    return EOK;
+}
+
+struct sdap_ad_get_dlg_state {
+    struct tevent_context *ev_ctx;
+    struct sdap_options *opts;
+    struct sss_domain_info *domain;
+    const char *cname;
+    const char *orig_dn;
+
+    const char **attrs;
+    char *base_filter;
+
+    struct sdap_search_base **search_bases;
+    size_t search_base_iter;
+
+    struct sdap_id_op *op;
+
+    char **remote_dlgs;
+};
+
+static void sdap_ad_get_dlg_connect_done(struct tevent_req *subreq);
 
 static struct tevent_req *sdap_ad_get_dlg_send(TALLOC_CTX *mem_ctx,
                                                struct tevent_context *ev_ctx,
@@ -1845,6 +1907,13 @@ static struct tevent_req *sdap_ad_get_dlg_send(TALLOC_CTX *mem_ctx,
 {
     struct sdap_ad_get_dlg_state *state = NULL;
     struct tevent_req *req = NULL;
+    struct tevent_req *subreq = NULL;
+    char *clean_orig_dn = NULL;
+    char *oc_list = NULL;
+    char *sid_filter = NULL;
+    struct ad_id_ctx *subdom_id_ctx = NULL;
+    bool use_id_mapping;
+    errno_t ret;
 
     req = tevent_req_create(mem_ctx, &state, struct sdap_ad_get_dlg_state);
     if (req == NULL) {
@@ -1864,11 +1933,163 @@ static struct tevent_req *sdap_ad_get_dlg_send(TALLOC_CTX *mem_ctx,
         return tevent_req_post(req, ev_ctx);
     }
 
-    /* TODO */
+    DEBUG(SSSDBG_TRACE_LIBS,
+          "Searching for domain local groups in domain [%s]\n",
+          sdom->dom->name);
+
+    state->ev_ctx = ev_ctx;
+    state->opts = opts;
+    state->cname = cname;
+    state->orig_dn = orig_dn;
+    state->domain = sdom->dom;
+    state->search_bases = sdom->group_search_bases;
+    state->search_base_iter = 0;
+    use_id_mapping = sdap_idmap_domain_has_algorithmic_mapping(
+                                                         opts->idmap_ctx,
+                                                         sdom->dom->name,
+                                                         sdom->dom->domain_id);
+
+    ret = build_attrs_from_map(state, opts->group_map, SDAP_OPTS_GROUP,
+                               NULL, &state->attrs, NULL);
+    if (tevent_req_error(req, ret)) {
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    ret = sss_filter_sanitize(state, orig_dn, &clean_orig_dn);
+    if (tevent_req_error(req, ret)) {
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    oc_list = sdap_make_oc_list(state, opts->group_map);
+    if (tevent_req_nomem(oc_list, req)) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Failed to create objectClass list.\n");
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    if (use_id_mapping) {
+        /* There must be a SID to map from */
+        sid_filter = talloc_asprintf(state, "(%s=*)",
+                                opts->group_map[SDAP_AT_GROUP_OBJECTSID].name);
+        if (tevent_req_nomem(sid_filter, req)) {
+            return tevent_req_post(req, ev_ctx);
+        }
+    }
+
+    state->base_filter =
+                talloc_asprintf(state,
+                                "(&(%s:1.2.840.113556.1.4.803:=%d)"
+                                "(%s:1.2.840.113556.1.4.1941:=%s)"
+                                "(%s)(%s=*)%s)",
+                                opts->group_map[SDAP_AT_GROUP_TYPE].name,
+                                SDAP_AD_GROUP_TYPE_DOMAIN_LOCAL,
+                                opts->group_map[SDAP_AT_GROUP_MEMBER].name,
+                                clean_orig_dn,
+                                oc_list,
+                                opts->group_map[SDAP_AT_GROUP_NAME].name,
+                                sid_filter != NULL ? sid_filter : "");
+    if (tevent_req_nomem(state->base_filter, req)) {
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    talloc_zfree(clean_orig_dn);
+    talloc_zfree(oc_list);
+
+    subdom_id_ctx = talloc_get_type(sdom->pvt, struct ad_id_ctx);
+    state->op = sdap_id_op_create(state, subdom_id_ctx->ldap_ctx->conn_cache);
+    if (tevent_req_nomem(state->op, req)) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    subreq = sdap_id_op_connect_send(state->op, state, &ret);
+    if (tevent_req_nomem(subreq, req)) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+        return tevent_req_post(req, ev_ctx);
+    }
+    tevent_req_set_callback(subreq, sdap_ad_get_dlg_connect_done, req);
+
+    return req;
+}
+
+static void sdap_ad_get_dlg_base_next(struct tevent_req *subreq);
+
+static void sdap_ad_get_dlg_connect_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req = NULL;
+    struct sdap_ad_get_dlg_state *state = NULL;
+    int ret;
+    int dp_error = DP_ERR_FATAL;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct sdap_ad_get_dlg_state);
+
+    ret = sdap_id_op_connect_recv(subreq, &dp_error);
+    talloc_zfree(subreq);
+    if (tevent_req_error(req, ret)) {
+        return;
+    }
+
+    subreq = sdap_ad_get_dlg_base_send(state,
+                                state->ev_ctx,
+                                state->opts,
+                                state->domain,
+                                sdap_id_op_handle(state->op),
+                                state->search_bases[state->search_base_iter],
+                                state->base_filter,
+                                state->attrs,
+                                state->cname,
+                                state->orig_dn);
+    if (tevent_req_nomem(subreq, req)) {
+        return;
+    }
+    tevent_req_set_callback(subreq, sdap_ad_get_dlg_base_next, req);
+}
+
+static void sdap_ad_get_dlg_base_next(struct tevent_req *subreq)
+{
+    struct tevent_req *req = NULL;
+    struct sdap_ad_get_dlg_state *state = NULL;
+    char **remote_dlgs = NULL;
+    errno_t ret;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct sdap_ad_get_dlg_state);
+
+    ret = sdap_ad_get_dlg_base_recv(subreq, state, &remote_dlgs);
+    talloc_zfree(subreq);
+    if (tevent_req_error(req, ret)) {
+        return;
+    }
+
+    ret = merge_sids_array(state, state->remote_dlgs, remote_dlgs,
+                           &state->remote_dlgs);
+    if (tevent_req_error(req, ret)) {
+        return;
+    }
+
+    talloc_zfree(remote_dlgs);
+
+    /* Check for additional search bases, and iterate through again. */
+    state->search_base_iter++;
+    if (state->search_bases[state->search_base_iter] != NULL) {
+        subreq = sdap_ad_get_dlg_base_send(state,
+                                state->ev_ctx,
+                                state->opts,
+                                state->domain,
+                                sdap_id_op_handle(state->op),
+                                state->search_bases[state->search_base_iter],
+                                state->base_filter,
+                                state->attrs,
+                                state->cname,
+                                state->orig_dn);
+        if (tevent_req_nomem(subreq, req)) {
+            return;
+        }
+        tevent_req_set_callback(subreq, sdap_ad_get_dlg_base_next, req);
+        return;
+    }
 
     tevent_req_done(req);
-
-    return tevent_req_post(req, ev_ctx);
 }
 
 static errno_t sdap_ad_get_dlg_recv(struct tevent_req *req,
