@@ -1884,9 +1884,8 @@ struct tevent_req *sdap_get_and_parse_generic_send(TALLOC_CTX *memctx,
                                        clientctrls, sizelimit, timeout,
                                        sdap_get_and_parse_generic_parse_entry,
                                        state, flags);
-    if (!subreq) {
-        talloc_zfree(req);
-        return NULL;
+    if (tevent_req_nomem(subreq, req)) {
+        return tevent_req_post(req, ev);
     }
     tevent_req_set_callback(subreq, sdap_get_and_parse_generic_done, req);
 
