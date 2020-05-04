@@ -29,6 +29,8 @@
 #include "providers/ad/ad_common.h"
 #include "lib/idmap/sss_idmap.h"
 
+#define AD_AT_SID "objectSid"
+
 /**
  * Merge two non null terminated talloc_arrays of SID strings, checking for
  * duplicated SIDs and NULL elements
@@ -1832,9 +1834,18 @@ struct sdap_id_conn_ctx *get_ldap_conn_from_sdom_pvt(struct sdap_options *opts,
 /* Remote domain local groups (dlgs) */
 
 struct sdap_ad_get_dlg_base_state {
+    struct tevent_context *ev_ctx;
+    struct sdap_options *opts;
+    struct sss_domain_info *domain;
+    char *filter;
+    const char *cname;
+    const char *orig_dn;
+
     /* talloc_array (no NULL terminated) of SIDs */
     char **remote_dlgs;
 };
+
+static void sdap_ad_get_dlg_base_done(struct tevent_req *subreq);
 
 static struct tevent_req *sdap_ad_get_dlg_base_send(TALLOC_CTX *mem_ctx,
                                                 struct tevent_context *ev_ctx,
@@ -1848,7 +1859,10 @@ static struct tevent_req *sdap_ad_get_dlg_base_send(TALLOC_CTX *mem_ctx,
                                                 const char *orig_dn)
 {
     struct tevent_req *req = NULL;
+    struct tevent_req *subreq = NULL;
     struct sdap_ad_get_dlg_base_state *state = NULL;
+    int timeout;
+
 
     req = tevent_req_create(mem_ctx, &state, struct sdap_ad_get_dlg_base_state);
     if (req == NULL) {
@@ -1856,9 +1870,119 @@ static struct tevent_req *sdap_ad_get_dlg_base_send(TALLOC_CTX *mem_ctx,
         return NULL;
     }
 
+    state->ev_ctx = ev_ctx;
+    state->opts = opts;
+    state->domain = domain;
+    state->cname = cname;
+    state->orig_dn = orig_dn;
+    state->filter = sdap_combine_filters(state, filter, base->filter);
+    if (tevent_req_nomem(state->filter, req)) {
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    DEBUG(SSSDBG_TRACE_LIBS,
+          "Searching for domain local groups with filter [%s]\n",
+          state->filter);
+
+    timeout = dp_opt_get_int(opts->basic, SDAP_SEARCH_TIMEOUT);
+
+    subreq = sdap_get_and_parse_generic_send(state,
+                                             ev_ctx,
+                                             opts,
+                                             sh,
+                                             base->basedn,
+                                             base->scope,
+                                             state->filter,
+                                             attrs,
+                                             opts->group_map,
+                                             SDAP_OPTS_GROUP,
+                                             0,
+                                             NULL,
+                                             NULL,
+                                             0,
+                                             timeout,
+                                             true);
+    if (tevent_req_nomem(subreq, req)) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+        return tevent_req_post(req, ev_ctx);
+    }
+    tevent_req_set_callback(subreq, sdap_ad_get_dlg_base_done, req);
+
+    return req;
+}
+
+static void sdap_ad_get_dlg_base_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req = NULL;
+    struct sdap_ad_get_dlg_base_state *state = NULL;
+    struct sysdb_attrs **ldap_groups = NULL;
+    size_t ldap_groups_count = 0;
+    char **sids = NULL;
+    size_t num_sids = 0;
+    errno_t ret;
+    size_t i;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct sdap_ad_get_dlg_base_state);
+
+    ret = sdap_get_and_parse_generic_recv(subreq, state,
+                                          &ldap_groups_count,
+                                          &ldap_groups,
+                                          NULL, NULL);
+    talloc_zfree(subreq);
+    if (tevent_req_error(req, ret)) {
+        return;
+    }
+
+    sids = talloc_zero_array(state, char *, ldap_groups_count);
+    if (tevent_req_nomem(sids, req)) {
+      return;
+    }
+
+    for (i = 0, num_sids = 0; i < ldap_groups_count; i++) {
+        struct ldb_message_element *el = NULL;
+
+        ret = sysdb_attrs_get_el_ext(ldap_groups[i], AD_AT_SID, false, &el);
+        if (ret == ENOENT) {
+            DEBUG(SSSDBG_TRACE_LIBS, "Attribute [%s] not found in group\n",
+                  AD_AT_SID);
+            continue;
+        } else if (ret != EOK) {
+            DEBUG(SSSDBG_MINOR_FAILURE, "Could not read [%s] attribute: [%s]\n",
+                  AD_AT_SID, strerror(ret));
+            continue;
+        }
+
+        ret = sss_idmap_bin_sid_to_sid(state->opts->idmap_ctx->map,
+                                el->values[0].data,
+                                el->values[0].length,
+                                &sids[num_sids]);
+        if (ret != IDMAP_SUCCESS) {
+            DEBUG(SSSDBG_MINOR_FAILURE,
+                  "Could not convert binary SID to string: [%s]. Skipping\n",
+                   idmap_error_string(ret));
+            continue;
+        }
+
+        num_sids++;
+    }
+
+    /* shrink array to final number of elements */
+    sids = talloc_realloc(state, sids, char *, num_sids);
+    if (tevent_req_nomem(sids, req)) {
+      return;
+    }
+
+    ret = merge_sids_array(state, state->remote_dlgs, sids,
+                           &state->remote_dlgs);
+    if (tevent_req_error(req, ret)) {
+      return;
+    }
+
+    talloc_zfree(sids);
+
     tevent_req_done(req);
 
-    return tevent_req_post(req, ev_ctx);
 }
 
 static errno_t sdap_ad_get_dlg_base_recv(struct tevent_req *req,
