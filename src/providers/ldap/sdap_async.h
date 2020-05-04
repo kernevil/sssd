@@ -236,7 +236,9 @@ struct tevent_req *sdap_get_and_parse_generic_send(TALLOC_CTX *memctx,
 int sdap_get_and_parse_generic_recv(struct tevent_req *req,
                                     TALLOC_CTX *mem_ctx,
                                     size_t *reply_count,
-                                    struct sysdb_attrs ***reply);
+                                    struct sysdb_attrs ***reply,
+                                    size_t *_ref_count,
+                                    char ***_refs);
 
 struct tevent_req *sdap_get_generic_send(TALLOC_CTX *memctx,
                                          struct tevent_context *ev,

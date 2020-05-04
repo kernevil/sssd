@@ -1944,7 +1944,8 @@ static void sdap_get_groups_process(struct tevent_req *subreq)
     char **sysdb_groupnamelist;
 
     ret = sdap_get_and_parse_generic_recv(subreq, state,
-                                          &count, &groups);
+                                          &count, &groups,
+                                          NULL, NULL);
     talloc_zfree(subreq);
     if (ret) {
         tevent_req_error(req, ret);

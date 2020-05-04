@@ -885,7 +885,8 @@ static void sdap_search_user_process(struct tevent_req *subreq)
     bool next_base = false;
 
     ret = sdap_get_and_parse_generic_recv(subreq, state,
-                                          &count, &users);
+                                          &count, &users,
+                                          NULL, NULL);
     talloc_zfree(subreq);
     if (ret) {
         tevent_req_error(req, ret);

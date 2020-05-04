@@ -1834,6 +1834,10 @@ struct sdap_get_and_parse_generic_state {
 
     struct sdap_reply sreply;
     struct sdap_options *opts;
+
+    /* Referrals returned by the search */
+    size_t ref_count;
+    char **refs;
 };
 
 static void sdap_get_and_parse_generic_done(struct tevent_req *subreq);
@@ -1930,14 +1934,28 @@ static void sdap_get_and_parse_generic_done(struct tevent_req *subreq)
                                                       struct tevent_req);
     struct sdap_get_and_parse_generic_state *state =
                 tevent_req_data(req, struct sdap_get_and_parse_generic_state);
+    errno_t ret;
 
-    return generic_ext_search_handler(subreq, state->opts);
+    ret = sdap_get_generic_ext_recv(subreq, state,
+                                    &state->ref_count,
+                                    &state->refs);
+    talloc_zfree(subreq);
+    if (tevent_req_error(req, ret)) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sdap_get_generic_ext_recv failed [%d]: %s\n",
+              ret, sss_strerror(ret));
+        return;
+    }
+
+    tevent_req_done(req);
 }
 
 int sdap_get_and_parse_generic_recv(struct tevent_req *req,
                                     TALLOC_CTX *mem_ctx,
                                     size_t *reply_count,
-                                    struct sysdb_attrs ***reply)
+                                    struct sysdb_attrs ***reply,
+                                    size_t *_ref_count,
+                                    char ***_refs)
 {
     struct sdap_get_and_parse_generic_state *state = tevent_req_data(req,
                                      struct sdap_get_and_parse_generic_state);
@@ -1946,6 +1964,14 @@ int sdap_get_and_parse_generic_recv(struct tevent_req *req,
 
     *reply_count = state->sreply.reply_count;
     *reply = talloc_steal(mem_ctx, state->sreply.reply);
+
+    if (_ref_count != NULL) {
+        *_ref_count = state->ref_count;
+    }
+
+    if (_refs != NULL) {
+        *_refs = talloc_steal(mem_ctx, state->refs);
+    }
 
     return EOK;
 }
@@ -2001,7 +2027,9 @@ static void sdap_get_generic_done(struct tevent_req *subreq)
     errno_t ret;
 
     ret = sdap_get_and_parse_generic_recv(subreq, state,
-                                          &state->reply_count, &state->reply);
+                                          &state->reply_count,
+                                          &state->reply,
+                                          NULL, NULL);
     if (ret != EOK) {
         tevent_req_error(req, ret);
         return;
