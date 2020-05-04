@@ -1691,6 +1691,7 @@ static struct tevent_req *sdap_initgr_rfc2307bis_send(
 
 
     talloc_zfree(clean_orig_dn);
+    talloc_zfree(oc_list);
 
     ret = sdap_initgr_rfc2307bis_next_base(req);
 
