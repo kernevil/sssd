@@ -504,6 +504,8 @@ errno_t sdap_ad_resolve_sids_recv(struct tevent_req *req)
 
 struct sdap_ad_tokengroups_initgr_mapping_state {
     struct tevent_context *ev;
+    struct sdap_id_ctx *id_ctx;
+    struct sdap_id_conn_ctx *conn;
     struct sdap_options *opts;
     struct sdap_handle *sh;
     struct sdap_idmap_ctx *idmap_ctx;
@@ -514,6 +516,12 @@ struct sdap_ad_tokengroups_initgr_mapping_state {
     const char *username;
 
     struct sdap_id_op *op;
+
+    char **remote_dlgs;
+    char **missing_dlgs;
+    size_t num_missing_dlgs;
+    char **cached_dlgs;
+    size_t num_cached_dlgs;
 };
 
 static void
@@ -532,13 +540,16 @@ static errno_t handle_missing_pvt(TALLOC_CTX *mem_ctx,
 static struct tevent_req *
 sdap_ad_tokengroups_initgr_mapping_send(TALLOC_CTX *mem_ctx,
                                         struct tevent_context *ev,
+                                        struct sdap_id_ctx *id_ctx,
+                                        struct sdap_id_conn_ctx *conn,
                                         struct sdap_options *opts,
                                         struct sysdb_ctx *sysdb,
                                         struct sss_domain_info *domain,
                                         struct sdap_handle *sh,
                                         const char *name,
                                         const char *orig_dn,
-                                        int timeout)
+                                        int timeout,
+                                        char **remote_dlgs)
 {
     struct sdap_ad_tokengroups_initgr_mapping_state *state = NULL;
     struct tevent_req *req = NULL;
@@ -555,6 +566,8 @@ sdap_ad_tokengroups_initgr_mapping_send(TALLOC_CTX *mem_ctx,
     }
 
     state->ev = ev;
+    state->id_ctx = id_ctx;
+    state->conn = conn;
     state->opts = opts;
     state->sh = sh;
     state->idmap_ctx = opts->idmap_ctx;
@@ -562,6 +575,7 @@ sdap_ad_tokengroups_initgr_mapping_send(TALLOC_CTX *mem_ctx,
     state->domain = domain;
     state->timeout = timeout;
     state->orig_dn = orig_dn;
+    state->remote_dlgs = remote_dlgs;
     state->username = talloc_strdup(state, name);
     if (state->username == NULL) {
         ret = ENOMEM;
@@ -800,18 +814,22 @@ done:
     return ret;
 }
 
+static void
+sdap_ad_tokengroups_initgr_mapping_dlg_done(struct tevent_req *subreq);
+
 static void sdap_ad_tokengroups_initgr_mapping_done(struct tevent_req *subreq)
 {
     struct sdap_ad_tokengroups_initgr_mapping_state *state = NULL;
     struct tevent_req *req = NULL;
-    char **sids = NULL;
-    size_t num_sids = 0;
+    char **token_groups = NULL;
+    size_t num_token_groups = 0;
     errno_t ret;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct sdap_ad_tokengroups_initgr_mapping_state);
 
-    ret = sdap_get_ad_tokengroups_recv(state, subreq, &num_sids, &sids);
+    ret = sdap_get_ad_tokengroups_recv(state, subreq, &num_token_groups,
+                                       &token_groups);
     talloc_zfree(subreq);
     if (ret != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE, "Unable to acquire tokengroups [%d]: %s\n",
@@ -819,15 +837,127 @@ static void sdap_ad_tokengroups_initgr_mapping_done(struct tevent_req *subreq)
         goto done;
     }
 
+    /* Do not include the remote DLGs because they would be assigned a GID */
     ret = sdap_ad_save_group_membership_with_idmapping(state->username,
                                                        state->opts,
                                                        state->domain,
                                                        state->idmap_ctx,
-                                                       num_sids,
-                                                       sids);
+                                                       num_token_groups,
+                                                       token_groups);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               "sdap_ad_save_group_membership_with_idmapping failed.\n");
+        goto done;
+    }
+
+    /* Now process remote DLGs membership without assigning a GID */
+    if (talloc_array_length(state->remote_dlgs) > 0) {
+        size_t num_remote_dlgs = 0;
+
+        /*
+         * Concatenate the tokenGroup membership with remote DLGs.
+         * Do not use concatenate_string_array because the function
+         * expects the first array to be NULL terminated.
+         * The token_groups is a talloc_array no NULL terminated.
+         */
+        ret = merge_sids_array(state, token_groups, state->remote_dlgs,
+                               &state->remote_dlgs);
+        if (tevent_req_error(req, ret)) {
+            return;
+        }
+        num_remote_dlgs = talloc_array_length(state->remote_dlgs);
+
+        ret = sdap_ad_tokengroups_get_posix_members(state,
+                                                    state->domain,
+                                                    num_remote_dlgs,
+                                                    state->remote_dlgs,
+                                                    &state->num_missing_dlgs,
+                                                    &state->missing_dlgs,
+                                                    &state->num_cached_dlgs,
+                                                    &state->cached_dlgs);
+        if (ret != EOK) {
+            goto done;
+        }
+
+        /* download missing SIDs */
+        subreq = sdap_ad_resolve_sids_send(state,
+                                           state->ev,
+                                           state->id_ctx,
+                                           state->conn,
+                                           state->opts,
+                                           state->domain,
+                                           state->missing_dlgs);
+        if (subreq == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+
+        tevent_req_set_callback(subreq,
+                                sdap_ad_tokengroups_initgr_mapping_dlg_done,
+                                req);
+
+        return;
+    }
+
+done:
+    if (ret != EOK) {
+        tevent_req_error(req, ret);
+        return;
+    }
+
+    tevent_req_done(req);
+}
+
+static void
+sdap_ad_tokengroups_initgr_mapping_dlg_done(struct tevent_req *subreq)
+{
+    struct sdap_ad_tokengroups_initgr_mapping_state *state = NULL;
+    struct tevent_req *req = NULL;
+    char **cached_dlgs = NULL;
+    size_t num_cached_dlgs = 0;
+    errno_t ret;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req,
+                            struct sdap_ad_tokengroups_initgr_mapping_state);
+
+    ret = sdap_ad_resolve_sids_recv(subreq);
+    talloc_zfree(subreq);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "Unable to resolve missing SIDs [%d]: %s\n",
+              ret, strerror(ret));
+        goto done;
+    }
+
+    ret = sdap_ad_tokengroups_get_posix_members(state, state->domain,
+                                                state->num_missing_dlgs,
+                                                state->missing_dlgs,
+                                                NULL, NULL,
+                                                &num_cached_dlgs,
+                                                &cached_dlgs);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_MINOR_FAILURE,
+              "sdap_ad_tokengroups_get_posix_members failed [%d]: %s\n",
+              ret, strerror(ret));
+        goto done;
+    }
+
+    ret = merge_sids_array(state, state->cached_dlgs, cached_dlgs,
+                           &state->cached_dlgs);
+    if (tevent_req_error(req, ret)) {
+        DEBUG(SSSDBG_OP_FAILURE, "Failed to merge SIDs array: %s\n",
+              strerror(ret));
+        return;
+    }
+
+    /* update membership of existing DLGs without assign a GID */
+    ret = sdap_ad_tokengroups_update_members(state->username,
+                                             state->sysdb, state->domain,
+                                             state->cached_dlgs);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_MINOR_FAILURE, "Membership update failed [%d]: %s\n",
+              ret, strerror(ret));
         goto done;
     }
 
@@ -864,6 +994,8 @@ struct sdap_ad_tokengroups_initgr_posix_state {
     size_t num_missing_sids;
     char **cached_groups;
     size_t num_cached_groups;
+
+    char **remote_dlgs;
 };
 
 static void
@@ -885,7 +1017,8 @@ sdap_ad_tokengroups_initgr_posix_send(TALLOC_CTX *mem_ctx,
                                       struct sdap_handle *sh,
                                       const char *name,
                                       const char *orig_dn,
-                                      int timeout)
+                                      int timeout,
+                                      char **remote_dlgs)
 {
     struct sdap_ad_tokengroups_initgr_posix_state *state = NULL;
     struct tevent_req *req = NULL;
@@ -910,6 +1043,7 @@ sdap_ad_tokengroups_initgr_posix_send(TALLOC_CTX *mem_ctx,
     state->domain = domain;
     state->orig_dn = orig_dn;
     state->timeout = timeout;
+    state->remote_dlgs = remote_dlgs;
     state->username = talloc_strdup(state, name);
     if (state->username == NULL) {
         ret = ENOMEM;
@@ -1134,17 +1268,32 @@ sdap_ad_tokengroups_initgr_posix_tg_done(struct tevent_req *subreq)
     char **sids = NULL;
     size_t num_sids = 0;
     errno_t ret;
+    char **token_groups = NULL;
+    size_t num_token_groups = 0;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct sdap_ad_tokengroups_initgr_posix_state);
 
-    ret = sdap_get_ad_tokengroups_recv(state, subreq, &num_sids, &sids);
+    ret = sdap_get_ad_tokengroups_recv(state, subreq, &num_token_groups,
+                                       &token_groups);
     talloc_zfree(subreq);
     if (ret != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE, "Unable to acquire tokengroups [%d]: %s\n",
                                     ret, strerror(ret));
         goto done;
     }
+
+    /*
+     * Concatenate the tokenGroup membership with remote DLGs.
+     * Do not use concatenate_string_array because the function
+     * expects the first array to be NULL terminated.
+     * The token_groups is a talloc_array no NULL terminated.
+     */
+    ret = merge_sids_array(state, token_groups, state->remote_dlgs, &sids);
+    if (tevent_req_error(req, ret)) {
+        return;
+    }
+    num_sids = talloc_array_length(sids);
 
     ret = sdap_ad_tokengroups_get_posix_members(state, state->domain,
                                                 num_sids, sids,
@@ -1681,7 +1830,8 @@ sdap_ad_tokengroups_initgroups_send(TALLOC_CTX *mem_ctx,
                                     const char *name,
                                     const char *orig_dn,
                                     int timeout,
-                                    bool use_id_mapping)
+                                    bool use_id_mapping,
+                                    char **remote_dlgs)
 {
     struct sdap_ad_tokengroups_initgroups_state *state = NULL;
     struct tevent_req *req = NULL;
@@ -1710,15 +1860,16 @@ sdap_ad_tokengroups_initgroups_send(TALLOC_CTX *mem_ctx,
     if (state->use_id_mapping
             && !IS_SUBDOMAIN(state->domain)
             && state->domain->ignore_group_members == false) {
-        subreq = sdap_ad_tokengroups_initgr_mapping_send(state, ev, opts,
+        subreq = sdap_ad_tokengroups_initgr_mapping_send(state, ev, id_ctx,
+                                                         conn, opts,
                                                          sysdb, domain, sh,
                                                          name, orig_dn,
-                                                         timeout);
+                                                         timeout, remote_dlgs);
     } else {
         subreq = sdap_ad_tokengroups_initgr_posix_send(state, ev, id_ctx, conn,
                                                        opts, sysdb, domain, sh,
                                                        name, orig_dn,
-                                                       timeout);
+                                                       timeout, remote_dlgs);
     }
     if (subreq == NULL) {
         ret = ENOMEM;

@@ -3305,7 +3305,8 @@ static void sdap_ad_get_remote_dlg_done(struct tevent_req *subreq)
                                                      state->cname,
                                                      state->orig_dn,
                                                      state->timeout,
-                                                     state->use_id_mapping);
+                                                     state->use_id_mapping,
+                                                     state->remote_dlgs);
     } else {
         subreq = sdap_initgr_rfc2307bis_send(state, state->ev, state->opts,
                                              state->sdom, state->sh,

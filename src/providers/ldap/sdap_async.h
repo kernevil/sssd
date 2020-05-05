@@ -453,7 +453,8 @@ sdap_ad_tokengroups_initgroups_send(TALLOC_CTX *mem_ctx,
                                     const char *name,
                                     const char *orig_dn,
                                     int timeout,
-                                    bool use_id_mapping);
+                                    bool use_id_mapping,
+                                    char **remote_dlgs);
 
 errno_t
 sdap_ad_tokengroups_initgroups_recv(struct tevent_req *req);
