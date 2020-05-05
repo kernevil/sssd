@@ -1833,6 +1833,217 @@ struct sdap_id_conn_ctx *get_ldap_conn_from_sdom_pvt(struct sdap_options *opts,
 
 /* Remote domain local groups (dlgs) */
 
+static struct tevent_req *sdap_ad_get_dlg_send(TALLOC_CTX *mem_ctx,
+                                               struct tevent_context *ev_ctx,
+                                               struct sdap_options *opts,
+                                               struct sdap_domain *sdom,
+                                               const char *cname,
+                                               const char *orig_dn,
+                                               bool chase_referrals);
+
+static errno_t sdap_ad_get_dlg_recv(struct tevent_req *req,
+                                    TALLOC_CTX *mem_ctx,
+                                    char ***remote_dlgs);
+
+struct sdap_ad_get_dlg_referral_state {
+    struct tevent_context *ev_ctx;
+    struct sdap_options *opts;
+    const char *cname;
+    const char *orig_dn;
+
+    struct sdap_domain *ref_sdom;
+    struct sdap_id_op *ref_op;
+
+    /* talloc_array (no NULL terminated) of SIDs */
+    char **remote_dlgs;
+};
+
+static void sdap_ad_get_dlg_referral_conn_done(struct tevent_req *subreq);
+
+static struct tevent_req *
+sdap_ad_get_dlg_referral_send(TALLOC_CTX *mem_ctx,
+                              struct tevent_context *ev_ctx,
+                              struct sdap_options *opts,
+                              struct sss_domain_info *domain,
+                              const char *cname,
+                              const char *orig_dn,
+                              const char *referral)
+{
+    struct sdap_ad_get_dlg_referral_state *state = NULL;
+    struct tevent_req *req = NULL;
+    struct tevent_req *subreq = NULL;
+    struct sss_domain_info *ref_domain = NULL;
+    struct sdap_id_conn_ctx *ref_conn = NULL;
+    LDAPURLDesc *lud = NULL;
+    errno_t ret;
+
+    DEBUG(SSSDBG_TRACE_LIBS, "Search referral [%s]\n", referral);
+
+    req = tevent_req_create(mem_ctx, &state,
+                            struct sdap_ad_get_dlg_referral_state);
+    if (req == NULL) {
+        return NULL;
+    }
+
+    state->ev_ctx = ev_ctx;
+    state->opts = opts;
+    state->cname = cname;
+    state->orig_dn = orig_dn;
+
+    /* Parse the URL for the domain */
+    ret = ldap_url_parse(referral, &lud);
+    if (ret != LDAP_SUCCESS) {
+        DEBUG(SSSDBG_OP_FAILURE, "Failed to parse referral URI (%s)!\n",
+              referral);
+        tevent_req_error(req, EINVAL);
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    /*
+     * Active Directory returns the domain name as the hostname
+     * in these referrals, so we can use that to look up the
+     * necessary connection.
+     */
+    ref_domain = find_domain_by_name(domain, lud->lud_host, true);
+    if (ref_domain == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "Could not find domain matching [%s]\n",
+              lud->lud_host);
+        ldap_free_urldesc(lud);
+        tevent_req_error(req, EIO);
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    ldap_free_urldesc(lud);
+    lud = NULL;
+
+    /* Check if the referred domain is in the remote DLG search white list */
+    if (opts->remote_dlg_enabled_domains != NULL &&
+        !string_in_list(ref_domain->name,
+                discard_const_p(char *, opts->remote_dlg_enabled_domains),
+                false)) {
+        DEBUG(SSSDBG_TRACE_LIBS,
+              "Referred domain [%s] is not in whitelist, skipping it\n",
+              ref_domain->name);
+        tevent_req_done(req);
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    state->ref_sdom = sdap_domain_get(state->opts, ref_domain);
+    if (state->ref_sdom == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Could not find sdap domain matching [%s]\n",
+              ref_domain->name);
+        tevent_req_error(req, EINVAL);
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    ref_conn = get_ldap_conn_from_sdom_pvt(state->opts,
+                                           state->ref_sdom);
+    if (ref_conn == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "No connection for %s\n", ref_domain->name);
+        tevent_req_error(req, EINVAL);
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    state->ref_op = sdap_id_op_create(state, ref_conn->conn_cache);
+    if (tevent_req_nomem(state->ref_op, req)) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+        return tevent_req_post(req, ev_ctx);
+    }
+
+    subreq = sdap_id_op_connect_send(state->ref_op, state, &ret);
+    if (tevent_req_error(req, ret)) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "sdap_id_op_connect_send failed: %d(%s).\n",
+                                  ret, sss_strerror(ret));
+        return tevent_req_post(req, ev_ctx);
+    }
+    tevent_req_set_callback(subreq,
+                            sdap_ad_get_dlg_referral_conn_done,
+                            req);
+
+    return req;
+}
+
+static void sdap_ad_get_dlg_referral_done(struct tevent_req *subreq);
+
+static void sdap_ad_get_dlg_referral_conn_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req = NULL;
+    struct sdap_ad_get_dlg_referral_state *state = NULL;
+    errno_t ret;
+    int dp_error;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct sdap_ad_get_dlg_referral_state);
+
+    ret = sdap_id_op_connect_recv(subreq, &dp_error);
+    talloc_zfree(subreq);
+    if (tevent_req_error(req, ret)) {
+        if (dp_error == DP_ERR_OFFLINE) {
+            DEBUG(SSSDBG_MINOR_FAILURE,
+                    "Backend is marked offline, retry later!\n");
+        } else {
+            DEBUG(SSSDBG_OP_FAILURE,
+                    "Failed to connect to referred LDAP server: (%d)[%s]\n",
+                    ret, sss_strerror(ret));
+        }
+        return;
+    }
+
+    subreq = sdap_ad_get_dlg_send(state,
+                                  state->ev_ctx,
+                                  state->opts,
+                                  state->ref_sdom,
+                                  state->cname,
+                                  state->orig_dn,
+                                  false);
+    if (tevent_req_nomem(subreq, req)) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "No memory\n");
+        return;
+    }
+    tevent_req_set_callback(subreq, sdap_ad_get_dlg_referral_done, req);
+}
+
+static void sdap_ad_get_dlg_referral_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req = NULL;
+    struct sdap_ad_get_dlg_referral_state *state = NULL;
+    errno_t ret;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct sdap_ad_get_dlg_referral_state);
+
+    ret = sdap_ad_get_dlg_recv(subreq,
+                               state,
+                               &state->remote_dlgs);
+    talloc_zfree(subreq);
+    if (tevent_req_error(req, ret)) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Failed to get DLGs from referred domain [%s]\n",
+              state->ref_sdom->dom->name);
+        return;
+    }
+
+    tevent_req_done(req);
+}
+
+static int sdap_ad_get_dlg_referral_recv(struct tevent_req *req,
+                                         TALLOC_CTX *mem_ctx,
+                                         char ***remote_dlgs)
+{
+    struct sdap_ad_get_dlg_referral_state *state = NULL;
+
+    state = tevent_req_data(req, struct sdap_ad_get_dlg_referral_state);
+
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    if (remote_dlgs != NULL) {
+        *remote_dlgs = talloc_steal(mem_ctx, state->remote_dlgs);
+    }
+
+    return EOK;
+}
+
 struct sdap_ad_get_dlg_base_state {
     struct tevent_context *ev_ctx;
     struct sdap_options *opts;
@@ -1843,6 +2054,13 @@ struct sdap_ad_get_dlg_base_state {
 
     /* talloc_array (no NULL terminated) of SIDs */
     char **remote_dlgs;
+
+    /* NULL terminated talloc_array of referrals */
+    char **referrals;
+    size_t num_referrals;
+    size_t referrals_iter;
+
+    bool chase_referrals;
 };
 
 static void sdap_ad_get_dlg_base_done(struct tevent_req *subreq);
@@ -1856,7 +2074,8 @@ static struct tevent_req *sdap_ad_get_dlg_base_send(TALLOC_CTX *mem_ctx,
                                                 const char *filter,
                                                 const char **attrs,
                                                 const char *cname,
-                                                const char *orig_dn)
+                                                const char *orig_dn,
+                                                bool chase_referrals)
 {
     struct tevent_req *req = NULL;
     struct tevent_req *subreq = NULL;
@@ -1875,6 +2094,7 @@ static struct tevent_req *sdap_ad_get_dlg_base_send(TALLOC_CTX *mem_ctx,
     state->domain = domain;
     state->cname = cname;
     state->orig_dn = orig_dn;
+    state->chase_referrals = chase_referrals;
     state->filter = sdap_combine_filters(state, filter, base->filter);
     if (tevent_req_nomem(state->filter, req)) {
         return tevent_req_post(req, ev_ctx);
@@ -1911,6 +2131,8 @@ static struct tevent_req *sdap_ad_get_dlg_base_send(TALLOC_CTX *mem_ctx,
     return req;
 }
 
+static void sdap_ad_get_dlg_base_referral_next(struct tevent_req *subreq);
+
 static void sdap_ad_get_dlg_base_done(struct tevent_req *subreq)
 {
     struct tevent_req *req = NULL;
@@ -1928,7 +2150,8 @@ static void sdap_ad_get_dlg_base_done(struct tevent_req *subreq)
     ret = sdap_get_and_parse_generic_recv(subreq, state,
                                           &ldap_groups_count,
                                           &ldap_groups,
-                                          NULL, NULL);
+                                          &state->num_referrals,
+                                          &state->referrals);
     talloc_zfree(subreq);
     if (tevent_req_error(req, ret)) {
         return;
@@ -1981,8 +2204,72 @@ static void sdap_ad_get_dlg_base_done(struct tevent_req *subreq)
 
     talloc_zfree(sids);
 
-    tevent_req_done(req);
+    /* Now chase referrals */
+    if (state->chase_referrals && state->num_referrals > 0) {
+        subreq = sdap_ad_get_dlg_referral_send(state,
+                                    state->ev_ctx,
+                                    state->opts,
+                                    state->domain,
+                                    state->cname,
+                                    state->orig_dn,
+                                    state->referrals[state->referrals_iter]);
+        if (tevent_req_nomem(subreq,req)) {
+            return;
+        }
+        tevent_req_set_callback(subreq,
+                                sdap_ad_get_dlg_base_referral_next,
+                                req);
+        return;
+    }
 
+    tevent_req_done(req);
+}
+
+static void sdap_ad_get_dlg_base_referral_next(struct tevent_req *subreq)
+{
+    struct tevent_req *req = NULL;
+    struct sdap_ad_get_dlg_base_state *state = NULL;
+    char **referral_dlgs = NULL;
+    errno_t ret;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct sdap_ad_get_dlg_base_state);
+
+    ret = sdap_ad_get_dlg_referral_recv(subreq, state, &referral_dlgs);
+    talloc_zfree(subreq);
+
+    /*
+     * Do not abort the whole request on referral error, just continue with
+     * the next one
+     */
+    if (ret == EOK) {
+        ret = merge_sids_array(state, state->remote_dlgs, referral_dlgs,
+                               &state->remote_dlgs);
+        if (tevent_req_error(req, ret)) {
+            return;
+        }
+    }
+
+    state->referrals_iter++;
+    if (state->referrals_iter < state->num_referrals) {
+        char *referral = state->referrals[state->referrals_iter];
+        subreq = sdap_ad_get_dlg_referral_send(state,
+                                               state->ev_ctx,
+                                               state->opts,
+                                               state->domain,
+                                               state->cname,
+                                               state->orig_dn,
+                                               referral);
+        if (tevent_req_nomem(subreq,req)) {
+            return;
+        }
+        tevent_req_set_callback(subreq,
+                                sdap_ad_get_dlg_base_referral_next,
+                                req);
+        return;
+    }
+
+    tevent_req_done(req);
 }
 
 static errno_t sdap_ad_get_dlg_base_recv(struct tevent_req *req,
@@ -2017,6 +2304,8 @@ struct sdap_ad_get_dlg_state {
     struct sdap_id_op *op;
 
     char **remote_dlgs;
+
+    bool chase_referrals;
 };
 
 static void sdap_ad_get_dlg_connect_done(struct tevent_req *subreq);
@@ -2068,6 +2357,7 @@ static struct tevent_req *sdap_ad_get_dlg_send(TALLOC_CTX *mem_ctx,
     state->domain = sdom->dom;
     state->search_bases = sdom->group_search_bases;
     state->search_base_iter = 0;
+    state->chase_referrals = chase_referrals;
     use_id_mapping = sdap_idmap_domain_has_algorithmic_mapping(
                                                          opts->idmap_ctx,
                                                          sdom->dom->name,
@@ -2162,7 +2452,8 @@ static void sdap_ad_get_dlg_connect_done(struct tevent_req *subreq)
                                 state->base_filter,
                                 state->attrs,
                                 state->cname,
-                                state->orig_dn);
+                                state->orig_dn,
+                                state->chase_referrals);
     if (tevent_req_nomem(subreq, req)) {
         return;
     }
@@ -2205,7 +2496,8 @@ static void sdap_ad_get_dlg_base_next(struct tevent_req *subreq)
                                 state->base_filter,
                                 state->attrs,
                                 state->cname,
-                                state->orig_dn);
+                                state->orig_dn,
+                                state->chase_referrals);
         if (tevent_req_nomem(subreq, req)) {
             return;
         }
